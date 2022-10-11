@@ -11,6 +11,8 @@ from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, Re
 
 from torchvision.utils import save_image
 
+from covidxdataset import COVIDxDataset
+
 def get_dataset(dataset, data_path):
     if dataset == 'MNIST':
         channel = 1
@@ -94,6 +96,22 @@ def get_dataset(dataset, data_path):
             images_val[:, c] = (images_val[:, c] - mean[c]) / std[c]
 
         dst_test = TensorDataset(images_val, labels_val)  # no augmentation
+    
+    elif dataset == 'CovidX':
+        channel = 3
+        im_size = (224, 224)
+        num_classes = 2
+        mean = [0.4886, 0.4886, 0.4886]
+        std = [0.2460, 0.2460, 0.2460]
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize(im_size),
+            transforms.ToTensor(), 
+            transforms.Normalize(mean, std)
+            ])
+        dst_train = COVIDxDataset(transform=transform, flag='train') # no augmentation
+        dst_test = COVIDxDataset(transform=transform, flag='test')
+        class_names = dst_train.COVIDxDICT
 
     else:
         exit('unknown dataset: %s'%dataset)
