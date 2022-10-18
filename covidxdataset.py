@@ -36,7 +36,7 @@ class COVIDxDataset(Dataset):
 
     def __getitem__(self, index):
 
-        image = self.load_image(os.path.join(self.root, 'COVID', self.paths[index]), index)
+        image = self.load_image(os.path.join(self.root, 'COVID', self.paths[index]))
 
         image_tensor = self.transform(image)
 

@@ -12,6 +12,7 @@ from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, Re
 from torchvision.utils import save_image
 
 from covidxdataset import COVIDxDataset
+from cxrdataset import init_CXR
 
 def get_dataset(dataset, data_path):
     if dataset == 'MNIST':
@@ -104,7 +105,6 @@ def get_dataset(dataset, data_path):
         mean = [0.4886, 0.4886, 0.4886]
         std = [0.2460, 0.2460, 0.2460]
         transform = transforms.Compose([
-            transforms.ToPILImage(),
             transforms.Resize(im_size),
             transforms.ToTensor(), 
             transforms.Normalize(mean, std)
@@ -112,12 +112,26 @@ def get_dataset(dataset, data_path):
         dst_train = COVIDxDataset(transform=transform, flag='train') # no augmentation
         dst_test = COVIDxDataset(transform=transform, flag='test')
         class_names = dst_train.COVIDxDICT
+    
+    elif dataset == 'ChildXRay':
+        channel = 3
+        im_size = (224, 224)
+        num_classes = 2
+        mean = [0.4823, 0.4823, 0.4823]
+        std = [0.2361, 0.2361, 0.2361]
+        dst_train_ = init_CXR(mode='train') # no augmentation
+        np.random.seed(seed=int(time.time() * 1000) % 100000)
+        rand_idx = np.random.randint(0, len(dst_train_), len(dst_train_))
+        dst_train = torch.utils.data.Subset(dst_train_, rand_idx)
+        dst_test = init_CXR(mode='val')
+        class_names = [0,1]
+        
 
     else:
         exit('unknown dataset: %s'%dataset)
 
 
-    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=0)
+    testloader = torch.utils.data.DataLoader(dst_test, batch_size=32, shuffle=False, num_workers=0)
     return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader
 
 

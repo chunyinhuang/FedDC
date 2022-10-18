@@ -8,7 +8,8 @@ import torch.nn as nn
 from torchvision.utils import save_image
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
 
-
+from pretraineddataset import PretrainedDataset
+###
 def main():
 
     parser = argparse.ArgumentParser(description='Parameter Processing')
@@ -31,6 +32,7 @@ def main():
     parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
 
     args = parser.parse_args()
+    args.dc_aug_param = None
     args.method = 'DM'
     args.outer_loop, args.inner_loop = get_loops(args.ipc)
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -88,12 +90,19 @@ def main():
 
         ''' initialize the synthetic data '''
         image_syn = torch.randn(size=(num_classes*args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float, requires_grad=True, device=args.device)
-        label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
+        label_syn = torch.tensor(np.array([np.ones(args.ipc)*i for i in range(num_classes)]), dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
 
         if args.init == 'real':
             print('initialize synthetic data from random real images')
             for c in range(num_classes):
                 image_syn.data[c*args.ipc:(c+1)*args.ipc] = get_images(c, args.ipc).detach().data
+        elif args.init == 'MAE_CovidX':
+            print('initialize synthetic data from pretrained CovidX images')
+            pretrained_set = PretrainedDataset(dataset='MAE_CovidX', ipc = 50, im_size = [224, 224])
+            images_pretrained_set = [torch.unsqueeze(pretrained_set[i], dim=0) for i in range(len(pretrained_set))]
+            images_pretrained_set = torch.cat(images_pretrained_set, dim=0).to(args.device)
+            for c in range(num_classes):
+                image_syn.data[c*args.ipc:(c+1)*args.ipc] = images_pretrained_set[c*args.ipc:(c+1)*args.ipc].detach().data
         else:
             print('initialize synthetic data from random noise')
 
@@ -161,6 +170,7 @@ def main():
                     output_syn = embed(img_syn)
 
                     loss += torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
+                    
 
             else: # for ConvNetBN
                 images_real_all = []
@@ -185,7 +195,6 @@ def main():
                 output_syn = embed(images_syn_all)
 
                 loss += torch.sum((torch.mean(output_real.reshape(num_classes, args.batch_real, -1), dim=1) - torch.mean(output_syn.reshape(num_classes, args.ipc, -1), dim=1))**2)
-
 
 
             optimizer_img.zero_grad()

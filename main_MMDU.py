@@ -8,8 +8,17 @@ import torch.nn as nn
 from torchvision.utils import save_image
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
 
+from pretraineddataset import PretrainedDataset
+from mmdu_utils import MatConvert, MMDu, TST_MMD_u, ModelLatentF
 from mae_model import Get_MAE, MAE_encoder
+from torchvision import transforms
+from covidxdataset import COVIDxDataset
+from cxrdataset import init_CXR
+from torch.utils.data import DataLoader
 
+
+
+###
 def main():
 
     parser = argparse.ArgumentParser(description='Parameter Processing')
@@ -74,6 +83,7 @@ def main():
             indices_class[lab].append(i)
         images_all = torch.cat(images_all, dim=0).to(args.device)
         labels_all = torch.tensor(labels_all, dtype=torch.long, device=args.device)
+        print(f'    Using {len(images_all)} data')
 
 
 
@@ -84,8 +94,132 @@ def main():
             idx_shuffle = np.random.permutation(indices_class[c])[:n]
             return images_all[idx_shuffle]
 
+        def get_images_class_indep(n): # get random n images that are class independent
+            idx_shuffle = np.random.permutation(np.arange(len(images_all)))[:n]
+            return images_all[idx_shuffle]
+
         for ch in range(channel):
             print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
+
+
+
+        '''MMD pre-training'''
+
+        # Load pretrained MAE model
+        mae_net = Get_MAE()
+        mae_net.load_state_dict(torch.load('mae_covidx.pt', map_location=torch.device(args.device)))
+        mae_net_encoder = MAE_encoder(mae_net.encoder)
+        mae_net_encoder = mae_net_encoder.to(args.device)
+        mae_net_encoder.train()
+        for param in list(mae_net_encoder.parameters()):
+            param.requires_grad = False
+        print('Sucessfully load MAE encoder')
+
+        dtype = torch.float
+        N_per = 200 # permutation times
+        d = 1024
+        n = 50
+        x_in = d # number of neurons in the input layer, i.e., dimension of data
+        H =3*d # number of neurons in the hidden layer
+        x_out = 3*d # number of neurons in the output layer
+        learning_rate = 0.00005 # default learning rate for MMD-D on HDGM
+        N_epoch = 100 # number of training epochs
+        
+        model_u = ModelLatentF(x_in, H, x_out).to(args.device)
+        
+        epsilonOPT = torch.log(MatConvert(np.random.rand(1) * 10 ** (-10), args.device, dtype))
+        epsilonOPT.requires_grad = True
+        sigmaOPT = MatConvert(np.ones(1) * np.sqrt(2 * d), args.device, dtype)
+        sigmaOPT.requires_grad = True
+        sigma0OPT = MatConvert(np.ones(1) * np.sqrt(0.1), args.device, dtype)
+        sigma0OPT.requires_grad = True
+
+        # Setup optimizer for training deep kernel
+        optimizer_u = torch.optim.Adam(list(model_u.parameters()) + [epsilonOPT] + [sigmaOPT] + [sigma0OPT],
+                                    lr=learning_rate)
+        s1 = mae_net_encoder(get_images_class_indep(n))[0]
+        s2 = mae_net_encoder(get_images_class_indep(n))[0]
+        S = torch.cat((s1, s2), dim=0).to(args.device)
+        # S = MatConvert(S, args.device, dtype)
+        N1 = len(S)//2
+
+
+        # Get data from CovidX and ChildXRay for training MMD on different distributions
+        # CovidX
+        im_size = (224, 224)
+        covidx_mean = [0.4886, 0.4886, 0.4886]
+        covidx_std = [0.2460, 0.2460, 0.2460]
+        covidx_transform = transforms.Compose([
+            transforms.Resize(im_size),
+            transforms.ToTensor(), 
+            transforms.Normalize(covidx_mean, covidx_std)
+            ])
+        covidx_train_ = COVIDxDataset(transform=covidx_transform, flag='train') 
+        # ChildXRay
+        cxr_train_ = init_CXR(mode='train') 
+        # Subset
+        train_length = min(len(covidx_train_), len(cxr_train_))
+        rand_idx = np.random.randint(0, train_length, train_length)
+        covidx_train = torch.utils.data.Subset(covidx_train_, rand_idx)
+        cxr_train = torch.utils.data.Subset(cxr_train_, rand_idx)
+        covidx_loader = DataLoader(covidx_train, batch_size=n, shuffle=True, num_workers=4)
+        cxr_loader = DataLoader(cxr_train, batch_size=n, shuffle=True, num_workers=4)
+
+        # Train deep kernel to maximize test power
+        np.random.seed(seed=1102)
+        torch.manual_seed(1102)
+        torch.cuda.manual_seed(1102)
+        mmds___ = []
+        print('\n----------Begin Training MMD kernel----------')
+        for t in range(N_epoch):
+            for covidx_data, cxr_data in zip(covidx_loader, cxr_loader):
+                covidx_images, _ = covidx_data
+                cxr_images, _ = cxr_data
+                covidx_images = covidx_images.to(args.device)
+                cxr_images = cxr_images.to(args.device)
+                s1_ = mae_net_encoder(covidx_images)[0]
+                s2_ = mae_net_encoder(cxr_images)[0]
+                S_ = torch.cat((s1_, s2_), dim=0).to(args.device)
+                N_ = len(S_)//2
+                # Compute epsilon, sigma and sigma_0
+                ep = torch.exp(epsilonOPT) / (1 + torch.exp(epsilonOPT))
+                sigma = sigmaOPT ** 2
+                sigma0_u = sigma0OPT ** 2
+                # Compute output of the deep network
+                modelu_output = model_u(S_)
+                # Compute J (STAT_u)
+                TEMP = MMDu(modelu_output, N_, S_, sigma, sigma0_u, ep)
+                mmd_value_temp = -(TEMP[0]+10**(-8))
+                mmd_std_temp = torch.sqrt(TEMP[1]+10**(-8))
+                if mmd_std_temp.item() == 0:
+                    print('error!!')
+                if np.isnan(mmd_std_temp.item()):
+                    print('error!!')
+                STAT_u = torch.div(mmd_value_temp, mmd_std_temp)
+                # Initialize optimizer and Compute gradient
+                optimizer_u.zero_grad()
+                STAT_u.backward(retain_graph=True)
+                # Update weights using gradient descent
+                optimizer_u.step()
+                # Print MMD, std of MMD and J
+            if t % 10 ==0:
+                print("mmd_value: ", -1 * mmd_value_temp.item(), "mmd_std: ", mmd_std_temp.item(), "Statistic: ",
+                    -1 * STAT_u.item())
+                mmds___.append(-1 * mmd_value_temp.item())
+        
+        h_u, threshold_u, mmd_value_u = TST_MMD_u(model_u(S), N_per, N1, S, sigma, sigma0_u, ep, 0.5, args.device, dtype)
+        print("MMD_value:", mmd_value_u)
+        torch.save(model_u.state_dict(), './pretrained/modelu_xray.pt')
+        print(f'Saved model in ./pretrained/modelu_xray.pt')
+        print('----------Finish Training MMDu kernel----------\n')
+
+        model_u.train()
+        for param in list(model_u.parameters()):
+            param.requires_grad = False
+        epsilonOPT.requires_grad = False
+        sigmaOPT.requires_grad = False
+        sigma0OPT.requires_grad = False
+
 
 
         ''' initialize the synthetic data '''
@@ -96,20 +230,16 @@ def main():
             print('initialize synthetic data from random real images')
             for c in range(num_classes):
                 image_syn.data[c*args.ipc:(c+1)*args.ipc] = get_images(c, args.ipc).detach().data
+        elif args.init == 'MAE_CovidX':
+            print('initialize synthetic data from pretrained CovidX images')
+            pretrained_set = PretrainedDataset(dataset='MAE_CovidX', ipc = 50, im_size = [224, 224])
+            images_pretrained_set = [torch.unsqueeze(pretrained_set[i], dim=0) for i in range(len(pretrained_set))]
+            images_pretrained_set = torch.cat(images_pretrained_set, dim=0).to(args.device)
+            for c in range(num_classes):
+                image_syn.data[c*args.ipc:(c+1)*args.ipc] = images_pretrained_set[c*args.ipc:(c+1)*args.ipc].detach().data
         else:
             print('initialize synthetic data from random noise')
 
-
-        # '''Load pretrained MAE model'''
-        # mae_net = Get_MAE()
-        # mae_net.load_state_dict(torch.load('mae_covidx.pt', map_location=torch.device(args.device)))
-        
-        # net = MAE_encoder(mae_net.encoder)
-        # net = net.to(args.device)
-        # net.train()
-        # for param in list(net.parameters()):
-        #     param.requires_grad = False
-        # print('Sucessfully load MAE encoder')
 
 
         ''' training '''
@@ -139,7 +269,7 @@ def main():
                         accs_all_exps[model_eval] += accs
 
                 ''' visualize and save '''
-                save_name = os.path.join(args.save_path, 'vis_%s_%s_%s_%dipc_exp%d_iter%d.png'%(args.method, args.dataset, args.model, args.ipc, exp, it))
+                save_name = os.path.join(args.save_path, 'modelu_output_%s_iter%d.png'%(args.dataset, it))
                 image_syn_vis = copy.deepcopy(image_syn.detach().cpu())
                 for ch in range(channel):
                     image_syn_vis[:, ch] = image_syn_vis[:, ch]  * std[ch] + mean[ch]
@@ -154,48 +284,62 @@ def main():
             # net.train()
             # for param in list(net.parameters()):
             #     param.requires_grad = False
-            
+
             # embed = net.module.embed if torch.cuda.device_count() > 1 else net.embed # for GPU parallel
-
-            '''Load MAE model'''
-            mae_net = Get_MAE()
-            net = MAE_encoder(mae_net.encoder)
-            net = net.to(args.device)
-            net.train()
-            for param in list(net.parameters()):
-                param.requires_grad = False
-            # print('Sucessfully load MAE encoder')
-
-            embed = net.module if torch.cuda.device_count() > 1 else net # for GPU parallel
+            # embed = mae_net_encoder.module if torch.cuda.device_count() > 1 else mae_net_encoder # for GPU parallel
 
             loss_avg = 0
 
             ''' update synthetic data '''
+            torch.autograd.set_detect_anomaly(True)
             if 'BN' not in args.model: # for ConvNet
+            # if False:
                 loss = torch.tensor(0.0).to(args.device)
                 for c in range(num_classes):
-                    img_real = get_images(c, args.batch_real)
+                    img_real = get_images(c, args.ipc)
                     img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
-
                     if args.dsa:
                         seed = int(time.time() * 1000) % 100000
                         img_real = DiffAugment(img_real, args.dsa_strategy, seed=seed, param=args.dsa_param)
                         img_syn = DiffAugment(img_syn, args.dsa_strategy, seed=seed, param=args.dsa_param)
 
-                    output_real = embed(img_real)[1].detach()
-                    output_syn = embed(img_syn)[1]
+                    # output_real = embed(img_real)[1].detach()
+                    # output_syn = embed(img_syn)[1]
 
-                    loss += torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
+                    # loss += torch.sum((torch.mean(output_real, dim=0) - torch.mean(output_syn, dim=0))**2)
 
-                    # print(f'Embedded dim: {output_real.size()}')
-                    # print(f'Loss: {loss.item()}')
+                    s1 = mae_net_encoder(img_real)[0]
+                    s2 = mae_net_encoder(img_syn)[0]
+                    S = torch.cat((s1, s2), dim=0).to(args.device)
+                    # S = MatConvert(S, args.device, dtype)
+                    N1 = len(S)//2
+                    
+                    # h_u, threshold_u, mmd_value_u = TST_MMD_u(model_u(S), N_per, N1, S, sigma, sigma0_u, ep, 0.5, args.device, dtype)
+                    # loss += mmd_value_u
+
+                    ep = torch.exp(epsilonOPT) / (1 + torch.exp(epsilonOPT))
+                    sigma = sigmaOPT ** 2
+                    sigma0_u = sigma0OPT ** 2
+                    # Compute output of the deep network
+                    modelu_output = model_u(S)
+                    TEMP = MMDu(modelu_output, N1, S, sigma, sigma0_u, ep)
+                    mmd_value_temp = (TEMP[0]+10**(-8))
+                    mmd_std_temp = torch.sqrt(TEMP[1]+10**(-8))
+                    if mmd_std_temp.item() == 0:
+                        print('error!!')
+                    if np.isnan(mmd_std_temp.item()):
+                        print('error!!')
+                    STAT_u = torch.div(mmd_value_temp, mmd_std_temp) * 100
+                    loss += STAT_u
+
+                    
 
             else: # for ConvNetBN
                 images_real_all = []
                 images_syn_all = []
                 loss = torch.tensor(0.0).to(args.device)
                 for c in range(num_classes):
-                    img_real = get_images(c, args.batch_real)
+                    img_real = get_images(c, args.ipc)
                     img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
 
                     if args.dsa:
@@ -209,15 +353,38 @@ def main():
                 images_real_all = torch.cat(images_real_all, dim=0)
                 images_syn_all = torch.cat(images_syn_all, dim=0)
 
-                output_real = embed(images_real_all)[1].detach()
-                output_syn = embed(images_syn_all)[1]
+                # output_real = embed(images_real_all)[1].detach()
+                # output_syn = embed(images_syn_all)[1]
 
-                loss += torch.sum((torch.mean(output_real.reshape(num_classes, args.batch_real, -1), dim=1) - torch.mean(output_syn.reshape(num_classes, args.ipc, -1), dim=1))**2)
+                # loss += torch.sum((torch.mean(output_real.reshape(num_classes, args.batch_real, -1), dim=1) - torch.mean(output_syn.reshape(num_classes, args.ipc, -1), dim=1))**2)
 
+                s1 = mae_net_encoder(img_real)[0]
+                s2 = mae_net_encoder(img_syn)[0]
+                S = torch.cat((s1, s2), dim=0).to(args.device)
+                # S = MatConvert(S, args.device, dtype)
+                N1 = len(S)//2
 
+                # h_u, threshold_u, mmd_value_u = TST_MMD_u(model_u(S), N_per, N1, S, sigma, sigma0_u, ep, 0.5, args.device, dtype)
+                # loss += mmd_value_u
 
+                ep = torch.exp(epsilonOPT) / (1 + torch.exp(epsilonOPT))
+                sigma = sigmaOPT ** 2
+                sigma0_u = sigma0OPT ** 2
+                # Compute output of the deep network
+                modelu_output = model_u(S)
+                TEMP = MMDu(modelu_output, N1, S, sigma, sigma0_u, ep)
+                mmd_value_temp = -1 * (TEMP[0]+10**(-8))
+                mmd_std_temp = torch.sqrt(TEMP[1]+10**(-8))
+                if mmd_std_temp.item() == 0:
+                    print('error!!')
+                if np.isnan(mmd_std_temp.item()):
+                    print('error!!')
+                STAT_u = torch.div(mmd_value_temp, mmd_std_temp)
+                loss += STAT_u
+
+            # print(f'loss: {loss.item()}')
             optimizer_img.zero_grad()
-            loss.backward()
+            loss.backward(retain_graph=True)
             optimizer_img.step()
             loss_avg += loss.item()
 
@@ -236,6 +403,7 @@ def main():
     for key in model_eval_pool:
         accs = accs_all_exps[key]
         print('Run %d experiments, train on %s, evaluate %d random %s, mean  = %.2f%%  std = %.2f%%'%(args.num_exp, args.model, len(accs), key, np.mean(accs)*100, np.std(accs)*100))
+    print(mmds___)
 
 
 

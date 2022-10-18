@@ -8,6 +8,7 @@ import torch.nn as nn
 from torchvision.utils import save_image
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, epoch_ae, DiffAugment, ParamDiffAug
 
+from pretraineddataset import PretrainedDataset
 
 def main():
 
@@ -92,6 +93,11 @@ def main():
             print('initialize synthetic data from random real images')
             for c in range(num_classes):
                 image_syn.data[c*args.ipc:(c+1)*args.ipc] = get_images(c, args.ipc).detach().data
+        elif args.init == 'CovidX':
+            print('initialize synthetic data from pretrained CovidX images')
+            pretrained_set = PretrainedDataset(dataset='CovidX', ipcs = 50, im_size = [224, 224])
+            for c in range(num_classes):
+                image_syn.data[c*args.ipc:(c+1)*args.ipc] = pretrained_set[c*args.ipcs:(c+1)*args.ipc]
         else:
             print('initialize synthetic data from random noise')
 
@@ -153,6 +159,7 @@ def main():
             loss_avg = 0
             args.dc_aug_param = None  # Mute the DC augmentation when learning synthetic data (in inner-loop epoch function) in oder to be consistent with DC paper.
 
+            embed = net.module.embed if torch.cuda.device_count() > 1 else net.embed # for GPU parallel
 
             
             for ol in range(args.outer_loop):
@@ -181,8 +188,8 @@ def main():
                 label_real_all = []
                 loss = torch.tensor(0.0).to(args.device)
                 for c in range(num_classes):
-                    # img_real = get_images(c, args.batch_real)
-                    img_real = get_images(c, args.ipc*30)
+                    img_real = get_images(c, args.batch_real)
+                    # img_real = get_images(c, args.ipc*30)
                     lab_real = torch.ones((img_real.shape[0],), device=args.device, dtype=torch.long) * c
                     image_real_all.append(copy.deepcopy(img_real))
                     label_real_all.append(copy.deepcopy(lab_real))
@@ -194,6 +201,7 @@ def main():
                         img_real = DiffAugment(img_real, args.dsa_strategy, seed=seed, param=args.dsa_param)
                         img_syn = DiffAugment(img_syn, args.dsa_strategy, seed=seed, param=args.dsa_param)
 
+                    # Gradient Matching Loss
                     output_real = net(img_real)
                     loss_real = criterion(output_real, lab_real)
                     gw_real = torch.autograd.grad(loss_real, net_parameters)
@@ -203,7 +211,15 @@ def main():
                     loss_syn = criterion(output_syn, lab_syn)
                     gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True)
 
-                    loss += match_loss(gw_syn, gw_real, args)
+                    match_loss = match_loss(gw_syn, gw_real, args)
+
+                    # Distribution Matching Loss
+                    output_real = embed(img_real).detach()
+                    output_syn = embed(img_syn)
+
+                    mmd_loss = torch.sum((torch.mean(output_real.reshape(num_classes, args.batch_real, -1), dim=1) - torch.mean(output_syn.reshape(num_classes, args.ipc, -1), dim=1))**2)
+
+                    loss += 0.5* match_loss + mmd_loss
 
                     # for ii in range(30):
                     #     output_syn = net(img_syn)
@@ -223,20 +239,19 @@ def main():
 
 
                 ''' update network '''
-                # image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
-                # dst_syn_train = TensorDataset(image_syn_train, label_syn_train)
-                # trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
-                # for il in range(args.inner_loop):
-                #     # epoch('train', trainloader, net, optimizer_net, criterion, args, aug = True if args.dsa else False)
-                #     loss_ae = epoch_ae('train', trainloader, net, optimizer_net, criterion, args, aug = True if args.dsa else False)
+                image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
+                dst_syn_train = TensorDataset(image_syn_train, label_syn_train)
+                trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
+                for il in range(args.inner_loop):
+                    epoch('train', trainloader, net, optimizer_net, criterion, args, aug = True if args.dsa else False)
                 
-                # image_real_all = get_images(c, len(indices_class[c]))
-                # image_real_all = get_images(c, args.batch_real)
-                dst_real_train = TensorDataset(image_real_all, label_real_all)
-                trainloader = torch.utils.data.DataLoader(dst_real_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
-                # for il in range(args.inner_loop):
-                for il in range(2):
-                    loss_ae = epoch_ae('train', trainloader, net, optimizer_net, criterion_syn, args, aug = True if args.dsa else False)
+                # # image_real_all = get_images(c, len(indices_class[c]))
+                # # image_real_all = get_images(c, args.batch_real)
+                # dst_real_train = TensorDataset(image_real_all, label_real_all)
+                # trainloader = torch.utils.data.DataLoader(dst_real_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
+                # # for il in range(args.inner_loop):
+                # for il in range(2):
+                #     loss_ae = epoch_ae('train', trainloader, net, optimizer_net, criterion_syn, args, aug = True if args.dsa else False)
 
 
             loss_avg /= (num_classes*args.outer_loop)

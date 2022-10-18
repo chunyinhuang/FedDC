@@ -91,9 +91,11 @@ class MAE_encoder(nn.Module):
         # attend with vision transformer
 
         encoded_tokens = self.encoder.transformer(tokens)
+        b, _, _ = encoded_tokens.size()
+        encoded_tokens_ = encoded_tokens.view(b, -1)
         encoded_tokens = encoded_tokens.mean(dim = 1)
         encoded_tokens = self.to_latent(encoded_tokens)
 
         
-        return encoded_tokens
+        return encoded_tokens, encoded_tokens_
 
